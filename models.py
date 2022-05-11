@@ -1,109 +1,167 @@
-import math
-
-import numpy as np
-import scipy.optimize
-
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.nn.init as init
-""""""
-import os.path as osp
-
-import argparse
-import torch
-import torch.nn.functional as F
-from torch_geometric.datasets import Planetoid
-import torch_geometric.transforms as T
-from torch_geometric.nn import GCNConv, GAE, VGAE
-from torch_geometric.utils import train_test_split_edges
-
-torch.manual_seed(12345)
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, default='VGAE')
-parser.add_argument('--dataset', type=str, default='Cora')
-args = parser.parse_args()
-assert args.model in ['GAE', 'VGAE']
-assert args.dataset in ['Cora', 'CiteSeer', 'PubMed']
-kwargs = {'GAE': GAE, 'VGAE': VGAE}
 
 
+class Encoder(nn.Module):
 
-class Encoder(torch.nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, para, bias=True):
         super(Encoder, self).__init__()
-        self.conv1 = GCNConv(in_channels, 2 * out_channels, cached=True)
-        self.conv_mu = GCNConv(2 * out_channels, out_channels, cached=True)
-        self.conv_logvar = GCNConv(2 * out_channels, out_channels, cached=True)
 
-    def forward(self, x, edge_index):
-        x = F.relu(self.conv1(x, edge_index))
-        return self.conv_mu(x, edge_index), self.conv_logvar(x, edge_index)
+        self.Nseq = para['Nseq']
+        self.Nfea = para['Nfea']
+
+        self.hidden_dim = para['hidden_dim']
+        self.NLSTM_layer = para['NLSTM_layer']
+
+        self.embedd = nn.Embedding(self.Nfea, self.Nfea)
+        self.encoder_rnn = nn.LSTM(input_size=self.Nfea, hidden_size=self.hidden_dim,
+                                   num_layers=self.NLSTM_layer, bias=True,
+                                   batch_first=True, bidirectional=False)
+
+        for param in self.encoder_rnn.parameters():
+            if len(param.shape) >= 2:
+                nn.init.orthogonal_(param.data)
+            else:
+                nn.init.normal_(param.data)
+
+    def forward(self, X0, L0):
+
+        batch_size = X0.shape[0]
+        device = X0.device
+        enc_h0 = torch.zeros(self.NLSTM_layer * 1, batch_size, self.hidden_dim).to(device)
+        enc_c0 = torch.zeros(self.NLSTM_layer * 1, batch_size, self.hidden_dim).to(device)
+
+        X = self.embedd(X0)
+        out, (encoder_hn, encoder_cn) = self.encoder_rnn(X, (enc_h0, enc_c0))
+        last_step_index_list = (L0 - 1).view(-1, 1).expand(out.size(0), out.size(2)).unsqueeze(1)
+        Z = out.gather(1, last_step_index_list).squeeze()
+        #        Z=torch.sigmoid(Z)
+        Z = F.normalize(Z, p=2, dim=1)
+
+        return Z
 
 
+class Decoder(nn.Module):
 
-#
-# channels = 16
-# dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# model = kwargs[args.model](Encoder(dataset.num_features, channels)).to(dev)
-# data.train_mask = data.val_mask = data.test_mask = data.y = None
-# data = train_test_split_edges(data)
-# x, train_pos_edge_index = data.x.to(dev), data.train_pos_edge_index.to(dev)
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-#
-#
-# def train():
-#     optimizer.zero_grad()
-#     z = model.encode(x, train_pos_edge_index)
-#     loss = model.recon_loss(z, train_pos_edge_index)
-#     if args.model in ['VGAE']:
-#         loss = loss + (1 / data.num_nodes) * model.kl_loss()
-#     loss.backward()
-#     optimizer.step()
-#
-#
-# def test(pos_edge_index, neg_edge_index):
-#     model.eval()
-#     with torch.no_grad():
-#         z = model.encode(x, train_pos_edge_index)
-#     return model.test(z, pos_edge_index, neg_edge_index)
-#
-#
-# for epoch in range(1, 401):
-#     train()
-#     auc, ap = test(data.test_pos_edge_index, data.test_neg_edge_index)
-#     print('Epoch: {:03d}, AUC: {:.4f}, AP: {:.4f}'.format(epoch, auc, ap))
-# """"""
+    def __init__(self, para, bias=True):
+        super(Decoder, self).__init__()
 
-class VAE(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, max_num_nodes, pool='sum'):
-        '''
-            Args
-            input_dim: input feature dimension for node.
-            hidden_dim: hidden dim for 2-layer gcn.
-            latent_dim: dimension of the latent representation of graph.
-        '''
-        super(VAE, self).__init__()
+        self.Nseq = para['Nseq']
+        self.Nfea = para['Nfea']
 
-        self.conv1 = GraphConv(input_dim=input_dim, output_dim=hidden_dim)
-        self.bn1 = nn.BatchNorm1d(input_dim)
+        self.hidden_dim = para['hidden_dim']
+        self.NLSTM_layer = para['NLSTM_layer']
 
-        self.con2 = GraphConv(input_dim=hidden_dim, output_dim=hidden_dim)
-        self.bn2 = nn.BatchNorm1d(input_dim)
-        self.act = nn.ReLU()
+        self.embedd = nn.Embedding(self.Nfea, self.Nfea)
 
-        output_dim = max_num_nodes * (max_num_nodes+1) // 2
-        self.vae = MLP_VAE_plain(input_dim*input_dim, latent_dim, output_dim)
+        #        self.decoder_rnn = nn.LSTM(input_size=self.Nfea,
+        self.decoder_rnn = nn.LSTM(input_size=self.Nfea + self.hidden_dim,
+                                   hidden_size=self.hidden_dim, num_layers=self.NLSTM_layer,
+                                   bias=True, batch_first=True, bidirectional=False)
 
-        self.max_num_nodes = max_num_nodes
-        self.pool = pool
+        for param in self.decoder_rnn.parameters():
+            if len(param.shape) >= 2:
+                nn.init.orthogonal_(param.data)
+            else:
+                nn.init.normal_(param.data)
 
+        self.decoder_fc1 = nn.Linear(self.hidden_dim, self.Nfea)
+        nn.init.xavier_normal_(self.decoder_fc1.weight.data)
+        nn.init.normal_(self.decoder_fc1.bias.data)
+
+    def forward(self, Z, X0, L0):
+
+        batch_size = Z.shape[0]
+        device = Z.device
+        dec_h0 = torch.zeros(self.NLSTM_layer * 1, batch_size, self.hidden_dim).to(device)
+        dec_c0 = torch.zeros(self.NLSTM_layer * 1, batch_size, self.hidden_dim).to(device)
+
+        X = self.embedd(X0)
+        Zm = Z.view(-1, 1, self.hidden_dim).expand(-1, self.Nseq, self.hidden_dim)
+        ZX = torch.cat((Zm, X), 2)
+
+        #        dec_out,(decoder_hn,decoder_cn)=self.decoder_rnn(X0,(Z.view(1,-1,self.hidden_dim),dec_c0))
+        dec_out, (decoder_hn, decoder_cn) = self.decoder_rnn(ZX, (dec_h0, dec_c0))
+        dec = self.decoder_fc1(dec_out)
+        return dec
+
+    def decoding(self, Z):
+        batch_size = Z.shape[0]
+        device = Z.device
+        dec_h0 = torch.zeros(self.NLSTM_layer * 1, batch_size, self.hidden_dim).to(device)
+        dec_c0 = torch.zeros(self.NLSTM_layer * 1, batch_size, self.hidden_dim).to(device)
+
+        seq = torch.zeros([batch_size, 1], dtype=torch.long).to(device)
+        seq[:, 0] = self.Nfea - 2
+
+        #        Xdata_onehot=torch.zeros([batch_size,1,self.Nfea],dtype=torch.float32).to(device)
+        #        Xdata_onehot[:,0,self.Nfea-2]=1
+        Y = seq
+        Zm = Z.view(-1, 1, self.hidden_dim).expand(-1, 1, self.hidden_dim)
+
+        decoder_hn = dec_h0
+        decoder_cn = dec_c0
+        #        seq2=Xdata_onehot
+        for i in range(self.Nseq):
+            dec_h0 = decoder_hn
+            dec_c0 = decoder_cn
+
+            X = self.embedd(Y)
+            ZX = torch.cat((Zm, X), 2)
+            dec_out, (decoder_hn, decoder_cn) = self.decoder_rnn(ZX, (dec_h0, dec_c0))
+            dec = self.decoder_fc1(dec_out)
+            Y = torch.argmax(dec, dim=2)
+            #            Xdata_onehot=torch.zeros([batch_size,self.Nfea],dtype=torch.float32).to(device)
+            #            Xdata_onehot=Xdata_onehot.scatter_(1,Y,1).view(-1,1,self.Nfea)
+            seq = torch.cat((seq, Y), dim=1)
+        #            seq2=torch.cat((seq2,dec),dim=1)
+
+        return seq  # , seq2[:,1:]
+
+
+class Predictor(nn.Module):
+    def __init__(self, para, bias=True):
+        super(Predictor, self).__init__()
+        self.hidden_dim = para['hidden_dim']
+        self.fc1 = nn.Linear(self.hidden_dim, 1)
+        nn.init.xavier_normal_(self.fc1.weight.data)
+        nn.init.normal_(self.fc1.bias.data)
+        self.fc2 = nn.Linear(self.hidden_dim, 1)
+        nn.init.xavier_normal_(self.fc2.weight.data)
+        nn.init.normal_(self.fc2.bias.data)
+
+    def forward(self, Z):  # Z encoder之后的embedding
+        y1, y2 = self.fc1(Z), self.fc2(Z)
+        return y1, y2
+
+    def Loss(self, y_real, y_pred):
+        x = y_real - y_pred
+        x = x ** 2
+        return torch.sum(x) / y_real.shape[0]
+
+
+class BinaryClassfier(nn.Module):
+    def __init__(self, para, bias=True):
+        super(BinaryClassfier, self).__init__()
+        self.hidden_dim = para['hidden_dim']
+        self.fc1 = nn.Linear(self.hidden_dim, 1)
+        nn.init.xavier_normal_(self.fc1.weight.data)
+        nn.init.normal_(self.fc1.bias.data)
+
+    def forward(self, Z):
+        return self.fc1(Z)
+
+    def Loss(self, y_real, y_pred):
+        x = y_real - y_pred
+        x = x ** 2
+        return torch.sum(x) / y_real.shape[0]
 
 
 class Discriminator(nn.Module):
     """Adversary architecture(Discriminator) for WAE-GAN."""
+
     def __init__(self, z_dim=10):
         super(Discriminator, self).__init__()
         self.z_dim = z_dim
@@ -122,9 +180,73 @@ class Discriminator(nn.Module):
             for m in self._modules[block]:
                 kaiming_init(m)
 
-    def forward(self, r,z):
+    def forward(self, r, z):
         z = torch.cat([z, r], 1)
         return self.net(z)
+
+
+class Critic(nn.Module):
+    def __init__(self, para, bias=True):
+        super(Critic, self).__init__()
+
+        self.hidden_dim = para['hidden_dim']
+
+        self.critic_fc1 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        nn.init.xavier_normal_(self.critic_fc1.weight.data)
+        nn.init.normal_(self.critic_fc1.bias.data)
+
+        self.critic_fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        nn.init.xavier_normal_(self.critic_fc2.weight.data)
+        nn.init.normal_(self.critic_fc2.bias.data)
+
+        self.critic_fc3 = nn.Linear(self.hidden_dim, 1)
+        nn.init.xavier_normal_(self.critic_fc3.weight.data)
+        nn.init.normal_(self.critic_fc3.bias.data)
+
+    def forward(self, Z0):
+        D1 = self.critic_fc1(Z0)
+        D1 = torch.relu(D1)
+        D2 = self.critic_fc2(D1)
+        D2 = torch.relu(D2)
+        Dout = self.critic_fc3(D2)
+
+        return Dout
+
+    def clip(self, epsi=0.01):
+        torch.clamp_(self.critic_fc1.weight.data, min=-epsi, max=epsi)
+        torch.clamp_(self.critic_fc1.bias.data, min=-epsi, max=epsi)
+        torch.clamp_(self.critic_fc2.weight.data, min=-epsi, max=epsi)
+        torch.clamp_(self.critic_fc2.bias.data, min=-epsi, max=epsi)
+        torch.clamp_(self.critic_fc3.weight.data, min=-epsi, max=epsi)
+        torch.clamp_(self.critic_fc3.bias.data, min=-epsi, max=epsi)
+
+
+class Net(nn.Module):
+
+    def __init__(self, para, bias=True):
+        super(Net, self).__init__()
+
+        self.Nseq = para['Nseq']
+        self.Nfea = para['Nfea']
+
+        self.hidden_dim = para['hidden_dim']
+        self.NLSTM_layer = para['NLSTM_layer']
+
+        self.Enc = Encoder(para)
+        self.Dec = Decoder(para)
+
+        self.Cri = Critic(para)
+        self.Pred = Predictor(para)
+        self.BinC = BinaryClassfier(para)
+        # self.Gen = Generator(para, self.Pred)
+
+    def AE(self, X0, L0, noise):
+        Z = self.Enc(X0, L0)
+        #        print(Z.shape, noise.shape)
+        Zn = Z + noise
+        decoded = self.Dec(Zn, X0, L0)
+
+        return decoded
 
 
 def kaiming_init(m):
@@ -136,47 +258,3 @@ def kaiming_init(m):
         m.weight.data.fill_(1)
         if m.bias is not None:
             m.bias.data.fill_(0)
-
-
-
-# GCN basic operation
-class GraphConv(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(GraphConv, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.weight = nn.Parameter(torch.FloatTensor(input_dim, output_dim).cuda())
-        # self.relu = nn.ReLU()
-    def forward(self, x, adj):
-        y = torch.matmul(adj, x)
-        y = torch.matmul(y,self.weight)
-        return y
-
-
-class MLP_VAE_plain(nn.Module):
-    def __init__(self, h_size, embedding_size, y_size):
-        super(MLP_VAE_plain, self).__init__()
-        self.encode_11 = nn.Linear(h_size, embedding_size) # mu
-        self.encode_12 = nn.Linear(h_size, embedding_size) # lsgms
-
-        self.decode_1 = nn.Linear(embedding_size, embedding_size)
-        self.decode_2 = nn.Linear(embedding_size, y_size) # make edge prediction (reconstruct)
-        self.relu = nn.ReLU()
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
-
-    def forward(self, h):
-        # encoder
-        z_mu = self.encode_11(h)
-        z_lsgms = self.encode_12(h)
-        # reparameterize
-        z_sgm = z_lsgms.mul(0.5).exp_()
-        eps = Variable(torch.randn(z_sgm.size())).cuda()
-        z = eps*z_sgm + z_mu
-        # decoder
-        y = self.decode_1(z)
-        y = self.relu(y)
-        y = self.decode_2(y)
-        return y, z_mu, z_lsgms

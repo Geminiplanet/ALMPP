@@ -31,7 +31,7 @@ class GraphVAE(nn.Module):
         self.max_num_nodes = max_num_nodes
         for m in self.modules():
             if isinstance(m, GraphConv):
-                m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
+                m.weight.data = init.xavier_uniform_(m.weight.data, gain=nn.init.calculate_gain('relu'))
             elif isinstance(m, nn.BatchNorm1d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
@@ -118,7 +118,7 @@ class GraphVAE(nn.Module):
         graph_h = input_features.view(-1, self.max_num_nodes * self.max_num_nodes)
         # vae
         h_decode, z_mu, z_lsgms = self.vae(graph_h)
-        out = F.sigmoid(h_decode)
+        out = torch.sigmoid(h_decode)
         out_tensor = out.cpu().data
         recon_adj_lower = self.recover_adj_lower(out_tensor)
         recon_adj_tensor = self.recover_full_adj_from_lower(recon_adj_lower)
@@ -228,10 +228,11 @@ class MLP_VAE_plain(nn.Module):
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
+                m.weight.data = init.xavier_uniform_(m.weight.data, gain=nn.init.calculate_gain('relu'))
 
     def forward(self, h):
         # encoder
+        # print("weight: ", self.encode_11.weight, "bias: ", self.encode_11.bias)
         z_mu = self.encode_11(h)
         z_lsgms = self.encode_12(h)
         # reparameterize

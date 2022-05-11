@@ -1,14 +1,8 @@
 import argparse
-import matplotlib.pyplot as plt
 import networkx as nx
-import numpy as np
 import os
-from random import shuffle
 import torch
-import torch.nn as nn
-import torch.nn.init as init
 from torch.autograd import Variable
-import torch.nn.functional as F
 from torch import optim
 from torch.optim.lr_scheduler import MultiStepLR
 
@@ -89,11 +83,13 @@ def main():
     print('CUDA', CUDA)
     ### running log
     graphs = []
-    for i in range(2, 3):
-        for j in range(2, 3):
+
+    for i in range(3, 4):
+        for j in range(3, 4):
             graphs.append(nx.grid_2d_graph(i, j))
     num_graphs_raw = len(graphs)
     for g in graphs:
+        nx.draw(g)
         print(g)
     if prog_args.max_num_nodes == -1:
         max_num_nodes = max([graphs[i].number_of_nodes() for i in range(len(graphs))])
